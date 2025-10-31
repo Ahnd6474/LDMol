@@ -50,6 +50,52 @@ The model performs a DDS-style text-guided molecule editing. `--source-text` sho
 CUDA_VISIBLE_DEVICES=0 torchrun --nnodes=1 --nproc_per_node=1 inference_dds.py --ckpt ./Pretrain/checkpoint_ldmol.pt --input-smiles="C[C@H](CCc1ccccc1)Nc1ccc(C#N)cc1F" --source-text="This molecule contains fluorine." --target-text="This molecule contains bromine."
 ```
 
+## 🧩 Reusable inference helpers
+
+We factored out the shared loading and encoding logic that powers the inference scripts into the `ldmol_inference.py` module. The utilities make it easy to stand up custom workflows that reuse the official checkpoints:
+
+```python
+import torch
+from ldmol_inference import (
+    build_diffusion_schedule,
+    decode_latents_to_smiles,
+    encode_text_descriptions,
+    load_autoencoder,
+    load_diffusion_model,
+    load_text_conditioner,
+)
+
+device = torch.device("cuda")
+
+model = load_diffusion_model("LDMol", "./Pretrain/checkpoint_ldmol.pt", device)
+diffusion = build_diffusion_schedule(100)
+autoencoder = load_autoencoder("./Pretrain/checkpoint_autoencoder.ckpt", device)
+conditioner = load_text_conditioner("molt5", device)
+
+embeds, pad_mask = encode_text_descriptions(
+    ["This molecule contains an amino group."],
+    conditioner,
+    description_length=200,
+    device=device,
+)
+
+noise = torch.randn(1, model.in_channels, model.input_size, 1, device=device)
+sample = diffusion.p_sample_loop(
+    model.forward,
+    noise.shape,
+    noise,
+    clip_denoised=False,
+    model_kwargs={"y": embeds.to(device).float(), "pad_mask": pad_mask.to(device).bool()},
+    progress=False,
+    device=device,
+)
+
+smiles = decode_latents_to_smiles(sample, autoencoder)
+print(smiles)
+```
+
+To confirm that your environment can instantiate every component without running a full diffusion chain, call `ldmol_inference.debug_components()`. The helper constructs each module on CPU, pushes dummy inputs through the pipeline, and exits once every interface succeeds.
+
 
 ## 💡 Acknowledgement
 * The code for DiT diffusion model is based on & modified from the official code of [DiT](https://github.com/facebookresearch/DiT).

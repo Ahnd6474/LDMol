@@ -1,17 +1,23 @@
 import torch
 import torch.distributed as dist
-from models import DiT_models
-from download import find_model
-from diffusion import create_diffusion
 from tqdm import tqdm
 import math
 import argparse
 from einops import repeat
-from transformers import T5ForConditionalGeneration, T5Tokenizer
-from train_autoencoder import ldmol_autoencoder
-from utils import AE_SMILES_decoder, molT5_encoder, get_validity, regexTokenizer
+from utils import get_validity
 import time
 from rdkit import Chem
+
+from models import DiT_models
+
+from ldmol_inference import (
+    build_diffusion_schedule,
+    decode_latents_to_smiles,
+    encode_text_descriptions,
+    load_autoencoder,
+    load_diffusion_model,
+    load_text_conditioner,
+)
 
 
 @torch.no_grad()
@@ -35,59 +41,25 @@ def main(args):
     if args.ckpt is None:
         raise ValueError("Please specify a checkpoint path with --ckpt.")
 
-    # Load model:
-    latent_size = 127
-    in_channels = 64  # 64
-    cross_attn = 768
-    condition_dim = 1024
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        in_channels=in_channels,
-        cross_attn=cross_attn,
-        condition_dim=condition_dim,
-    ).to(device)
-    # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
-    ckpt_path = args.ckpt
-    state_dict = find_model(ckpt_path)
-    msg = model.load_state_dict(state_dict, strict=False)
-    print('DiT from ', ckpt_path, msg)
-    model.eval()  # important!
-    diffusion = create_diffusion(str(args.num_sampling_steps))
+    model = load_diffusion_model(
+        args.model,
+        args.ckpt,
+        device,
+        text_encoder_name=args.text_encoder_name,
+    )
+    diffusion = build_diffusion_schedule(args.num_sampling_steps)
 
-    ae_config = {
-        'bert_config_decoder': './config_decoder.json',
-        'bert_config_encoder': './config_encoder.json',
-        'embed_dim': 256,
-    }
-    tokenizer = regexTokenizer(vocab_path='./vocab_bpe_300_sc.txt', max_len=127)#newtkn
-    ae_model = ldmol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer)
-    if args.vae:
-        print('LOADING PRETRAINED MODEL..', args.vae)
-        checkpoint = torch.load(args.vae, map_location='cpu')
-        try:
-            state_dict = checkpoint['model']
-        except:
-            state_dict = checkpoint['state_dict']
-        msg = ae_model.load_state_dict(state_dict, strict=False)
-        print('autoencoder', msg)
-    for param in ae_model.parameters():
-        param.requires_grad = False
-    del ae_model.text_encoder2
-    ae_model = ae_model.to(device)
-    ae_model.eval()
-    print(f'AE #parameters: {sum(p.numel() for p in ae_model.parameters())}, #trainable: {sum(p.numel() for p in ae_model.parameters() if p.requires_grad)}')
+    ae_model = load_autoencoder(
+        args.vae,
+        device,
+        tokenizer_path="./vocab_bpe_300_sc.txt",
+        config_encoder_path="./config_encoder.json",
+        config_decoder_path="./config_decoder.json",
+    )
 
-    # assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale != 1.0
 
-    text_encoder = T5ForConditionalGeneration.from_pretrained('laituan245/molt5-large-caption2smiles').to(device)
-    text_tokenizer = T5Tokenizer.from_pretrained("laituan245/molt5-large-caption2smiles", model_max_length=512)
-    del text_encoder.decoder
-
-    for param in text_encoder.parameters():
-        param.requires_grad = False
-    text_encoder.eval()
-    print(f'text encoder #parameters: {sum(p.numel() for p in text_encoder.parameters())}, #trainable: {sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)}')
+    conditioner = load_text_conditioner(args.text_encoder_name, device)
 
     dist.barrier()
     if rank == 0:
@@ -97,8 +69,18 @@ def main(args):
     prompt = args.prompt
     prompt_null = "no dsecription."
 
-    biot5_embed, pad_mask = molT5_encoder([prompt], text_encoder, text_tokenizer, args.description_length, device)
-    biot5_embed_null, pad_mask_null = molT5_encoder([prompt_null], text_encoder, text_tokenizer, args.description_length, device)
+    biot5_embed, pad_mask = encode_text_descriptions(
+        [prompt],
+        conditioner,
+        description_length=args.description_length,
+        device=device,
+    )
+    biot5_embed_null, pad_mask_null = encode_text_descriptions(
+        [prompt_null],
+        conditioner,
+        description_length=args.description_length,
+        device=device,
+    )
 
     biot5_embed = repeat(biot5_embed, '1 L D -> B L D', B=args.per_proc_batch_size)
     pad_mask = repeat(pad_mask, '1 L -> B L', B=args.per_proc_batch_size)
@@ -127,7 +109,7 @@ def main(args):
     st = time.time()
     for _ in pbar:
         # Sample inputs:
-        z = torch.randn(n, model.in_channels, latent_size, 1, device=device)
+        z = torch.randn(n, model.in_channels, model.input_size, 1, device=device)
 
         # Setup classifier-free guidance:
         if using_cfg:
@@ -148,8 +130,7 @@ def main(args):
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
         # print('zzzz', samples.shape)
 
-        samples = samples.squeeze(-1).permute((0, 2, 1))
-        samples = AE_SMILES_decoder(samples, ae_model     , stochastic=False, k=1)
+        samples = decode_latents_to_smiles(samples, ae_model, stochastic=False, k=1)
 
         # Save samples to disk as individual .png files
         with open('./generated_molecules.txt', 'a') as f:
